@@ -1,0 +1,9 @@
+{
+  "name": "SignSpeak AI",
+  "short_name": "SignSpeak",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a101b",
+  "theme_color": "#101827",
+  "description": "Sign language to voice assistant"
+}
