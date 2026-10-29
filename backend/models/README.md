@@ -1,0 +1,1 @@
+Place `sign_model.keras` and `labels.json` here after running `ml/train_model.py`. No pretrained NSL model is bundled.
