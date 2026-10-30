@@ -64,19 +64,30 @@ labels = []
 
 def load_model():
     global model, labels
-    if MODEL_PATH.exists() and LABELS_PATH.exists():
+    if LABELS_PATH.exists():
+        try:
+            labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"Error loading labels: {e}")
+            labels = []
+    if MODEL_PATH.exists():
         try:
             import tensorflow as tf
             model = tf.keras.models.load_model(MODEL_PATH)
-            labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
             print(f"Loaded sign model with labels: {labels}")
         except Exception as exc:
-            print(f"Could not load model: {exc}")
-            model, labels = None, []
+            try:
+                import keras
+                model = keras.models.load_model(MODEL_PATH)
+                print(f"Loaded sign model via keras: {labels}")
+            except Exception as exc2:
+                print(f"Could not load model: {exc} / {exc2}")
+                model = None
 
 def extract_features(rgb):
-    """Return 126 values: two hands, each 21 landmarks x (x,y,z)."""
+    """Return 126 values: two hands, each 21 landmarks x (x,y,z), and 2D normalized landmark coordinates."""
     hands = {}
+    landmarks_2d = {}
     if use_legacy_mp and tracker:
         result = tracker.process(rgb)
         if result.multi_hand_landmarks and result.multi_handedness:
@@ -84,6 +95,7 @@ def extract_features(rgb):
                 side = handedness.classification[0].label.lower()
                 arr = np.array([[p.x, p.y, p.z] for p in hand_lms.landmark], dtype=np.float32)
                 hands[side] = arr.flatten()
+                landmarks_2d[side] = [[round(float(p.x), 4), round(float(p.y), 4)] for p in hand_lms.landmark]
     elif tracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = tracker.detect(mp_image)
@@ -92,17 +104,26 @@ def extract_features(rgb):
                 side = handedness_cats[0].category_name.lower()
                 arr = np.array([[p.x, p.y, p.z] for p in hand_lms], dtype=np.float32)
                 hands[side] = arr.flatten()
+                landmarks_2d[side] = [[round(float(p.x), 4), round(float(p.y), 4)] for p in hand_lms]
 
     # Fixed order left then right; missing hands become zero vectors.
-    return np.concatenate([hands.get("left", np.zeros(63, dtype=np.float32)),
-                           hands.get("right", np.zeros(63, dtype=np.float32))]), len(hands)
+    feature_vec = np.concatenate([
+        hands.get("left", np.zeros(63, dtype=np.float32)),
+        hands.get("right", np.zeros(63, dtype=np.float32))
+    ])
+    return feature_vec, len(hands), landmarks_2d
 
 class PredictRequest(BaseModel):
     image: str = Field(..., description="Base64-encoded JPEG or data URL")
     session_id: str = "browser"
+    threshold: float | None = None
 
 class ResetRequest(BaseModel):
     session_id: str = "browser"
+
+class SimulateRequest(BaseModel):
+    phrase: str
+    confidence: float = 0.95
 
 @app.on_event("startup")
 def startup():
@@ -110,14 +131,40 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": model is not None,
-            "labels": labels, "sequence_length": SEQUENCE_LENGTH,
-            "confidence_threshold": CONFIDENCE_THRESHOLD}
+    return {
+        "status": "ok",
+        "service": "SignSpeak AI Backend",
+        "version": "1.0.0",
+        "model_loaded": model is not None,
+        "labels": labels,
+        "labels_count": len(labels),
+        "sequence_length": SEQUENCE_LENGTH,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "active_sessions": len(windows)
+    }
 
 @app.post("/reset")
 def reset(req: ResetRequest):
     windows[req.session_id].clear()
-    return {"ok": True}
+    return {"ok": True, "session_id": req.session_id, "cleared_frames": 0}
+
+@app.post("/simulate")
+def simulate(req: SimulateRequest):
+    """Utility endpoint to simulate prediction test events for UI demonstration."""
+    phrase = req.phrase.strip()
+    return {
+        "status": "recognized",
+        "hands_detected": 2,
+        "landmarks": {},
+        "recognized": True,
+        "phrase": phrase,
+        "confidence": round(float(req.confidence), 4),
+        "top_predictions": [{"phrase": phrase, "confidence": round(float(req.confidence), 4)}],
+        "model_loaded": True,
+        "frames_ready": SEQUENCE_LENGTH,
+        "required_frames": SEQUENCE_LENGTH,
+        "message": f"Simulated sign recognized: {phrase}"
+    }
 
 @app.post("/predict")
 def predict(req: PredictRequest):
@@ -129,34 +176,59 @@ def predict(req: PredictRequest):
             return {"status": "error", "message": "Invalid image"}
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         with tracker_lock:
-            features, hands_detected = extract_features(rgb)
+            features, hands_detected, landmarks_2d = extract_features(rgb)
         win = windows[req.session_id]
         win.append(features)
+        
+        target_threshold = req.threshold if (req.threshold is not None and 0.1 <= req.threshold <= 1.0) else CONFIDENCE_THRESHOLD
+
         response = {
             "status": "tracking" if hands_detected else "no_hand",
             "hands_detected": hands_detected,
+            "landmarks": landmarks_2d,
             "recognized": False,
             "phrase": None,
             "confidence": None,
+            "top_predictions": [],
             "model_loaded": model is not None,
             "frames_ready": len(win),
             "required_frames": SEQUENCE_LENGTH,
-            "message": "Model not trained. Collect NSL examples and train the model." if model is None else "Collecting movement sequence."
+            "message": "Model not trained. Collect NSL examples and train the model." if model is None else ("Collecting movement sequence..." if len(win) < SEQUENCE_LENGTH else "Analyzing temporal sequence...")
         }
         if model is None:
             return response
         if len(win) < SEQUENCE_LENGTH:
             return response
+
         batch = np.expand_dims(np.stack(win), axis=0)
         probs = model.predict(batch, verbose=0)[0]
         idx = int(np.argmax(probs))
         confidence = float(probs[idx])
         response["confidence"] = round(confidence, 4)
-        if confidence >= CONFIDENCE_THRESHOLD and idx < len(labels):
-            response.update({"recognized": True, "phrase": labels[idx], "status": "recognized",
-                             "message": "Sign recognized"})
+
+        # Build top 3 candidate predictions
+        top_indices = np.argsort(probs)[::-1][:3]
+        top_preds = []
+        for rank_idx in top_indices:
+            if rank_idx < len(labels):
+                top_preds.append({
+                    "phrase": labels[rank_idx],
+                    "confidence": round(float(probs[rank_idx]), 4)
+                })
+        response["top_predictions"] = top_preds
+
+        if confidence >= target_threshold and idx < len(labels):
+            response.update({
+                "recognized": True,
+                "phrase": labels[idx],
+                "status": "recognized",
+                "message": f"Sign recognized: {labels[idx]}"
+            })
         else:
-            response.update({"status": "uncertain", "message": "Sign uncertain; please repeat"})
+            response.update({
+                "status": "uncertain",
+                "message": f"Sign uncertain (confidence {round(confidence, 2)} < {round(target_threshold, 2)}); please hold or repeat"
+            })
         return response
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
