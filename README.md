@@ -2,7 +2,7 @@
 
 An advanced, trainable prototype for real-time sign-to-text-to-speech. It includes a responsive web/PWA interface, FastAPI backend, MediaPipe hand tracking, temporal LSTM training pipeline, dataset collection tool, and browser speech synthesis in English, Nepali, or Hindi.
 
-## Important limitation
+## Important limitation project
 This is **not a pretrained Nepali Sign Language (NSL) translator**. There is no bundled validated NSL model or dataset. NSL signs must be collected/labeled with fluent signers or sourced from a properly licensed, representative dataset. Until you train a model, the UI can show hand-tracking status but will label phrase recognition as unavailable. Do not present untrained signs as recognized. This starter uses hand landmarks; real NSL translation may also need body pose, facial expression, two-hand coordination, and sign-language grammar.
 
 ## Requirements
